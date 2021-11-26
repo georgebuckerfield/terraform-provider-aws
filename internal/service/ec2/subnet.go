@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/aws-sdk-go-base/tfawserr"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 	"github.com/hashicorp/terraform-provider-aws/internal/conns"
 	tftags "github.com/hashicorp/terraform-provider-aws/internal/tags"
 	"github.com/hashicorp/terraform-provider-aws/internal/tfresource"
@@ -107,6 +108,32 @@ func ResourceSubnet() *schema.Resource {
 			"ipv6_cidr_block_association_id": {
 				Type:     schema.TypeString,
 				Computed: true,
+			},
+
+			"cidr_reservation": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"reservation_id": {
+							Type:     schema.TypeString,
+							Required: false,
+							Computed: true,
+						},
+						"cidr": {
+							Type:             schema.TypeString,
+							Required:         true,
+							ValidateFunc:     verify.ValidCIDRNetworkAddress,
+							DiffSuppressFunc: suppressEqualCIDRBlockDiffs,
+						},
+						"type": {
+							Type:         schema.TypeString,
+							Required:     true,
+							ValidateFunc: validation.StringInSlice(ec2.SubnetCidrReservationType_Values(), false),
+						},
+					},
+				},
 			},
 
 			"arn": {
@@ -226,7 +253,13 @@ func resourceSubnetCreate(d *schema.ResourceData, meta interface{}) error {
 			return fmt.Errorf("error waiting for EC2 Subnet (%s) map public IP on launch update: %w", d.Id(), err)
 		}
 	}
-
+	if v, ok := d.GetOk("cidr_reservation"); ok && v.(*schema.Set).Len() > 0 {
+		log.Printf("[INFO] Creating CIDR reservations for %s", d.Id())
+		err := createCidrReservations(conn, d, v.(*schema.Set))
+		if err != nil {
+			return err
+		}
+	}
 	return resourceSubnetRead(d, meta)
 }
 
@@ -255,7 +288,6 @@ func resourceSubnetRead(d *schema.ResourceData, meta interface{}) error {
 				LastError: fmt.Errorf("EC2 Subnet (%s) not found", d.Id()),
 			})
 		}
-
 		return nil
 	})
 
@@ -478,6 +510,18 @@ func resourceSubnetUpdate(d *schema.ResourceData, meta interface{}) error {
 		}
 	}
 
+	if d.HasChange("cidr_reservation") {
+		o, n := d.GetChange("cidr_reservation")
+		os := o.(*schema.Set)
+		ns := n.(*schema.Set)
+		//del := os.Difference(ns).List()
+		add := ns.Difference(os)
+		err := createCidrReservations(conn, d, add)
+		if err != nil {
+			return err
+		}
+	}
+
 	return resourceSubnetRead(d, meta)
 }
 
@@ -584,4 +628,50 @@ func SubnetIpv6CidrStateRefreshFunc(conn *ec2.EC2, id string, associationId stri
 
 		return nil, "", nil
 	}
+}
+
+func createCidrReservations(conn *ec2.EC2, d *schema.ResourceData, v *schema.Set) error {
+	flattenedCidrReservations := []map[string]interface{}{}
+	for _, v := range v.List() {
+		v := v.(map[string]interface{})
+		log.Printf("[INFO] Creating reservation %v", v)
+		res, err := ec2SubnetCreateCidrReservation(conn, d.Id(), v, d.Timeout(schema.TimeoutCreate))
+		if err != nil {
+			return fmt.Errorf("error creating CIDR reservation: %w", err)
+		}
+		m := flattenSubnetCidrReservationOutput(res)
+		flattenedCidrReservations = append(flattenedCidrReservations, m)
+	}
+	err := d.Set("cidr_reservation", flattenedCidrReservations)
+	if err != nil {
+		return fmt.Errorf("error setting cidr reservation: %w", err)
+	}
+	return nil
+}
+
+func deleteCidrReservation(conn *ec2.EC2, d *schema.ResourceData, v *schema.Set) error {
+	return nil
+}
+
+func flattenSubnetCidrReservationOutput(res *ec2.SubnetCidrReservation) map[string]interface{} {
+	m := make(map[string]interface{})
+	m["reservation_id"] = aws.StringValue(res.SubnetCidrReservationId)
+	m["cidr"] = aws.StringValue(res.Cidr)
+	m["type"] = aws.StringValue(res.ReservationType)
+	return m
+}
+
+func ec2SubnetCreateCidrReservation(conn *ec2.EC2, subnetId string, tfMap map[string]interface{}, timeout time.Duration) (*ec2.SubnetCidrReservation, error) {
+
+	createOpts := &ec2.CreateSubnetCidrReservationInput{
+		Cidr:            aws.String(tfMap["cidr"].(string)),
+		SubnetId:        aws.String(subnetId),
+		ReservationType: aws.String(tfMap["type"].(string)),
+	}
+
+	resp, err := conn.CreateSubnetCidrReservation(createOpts)
+	if err != nil {
+		return nil, err
+	}
+	return resp.SubnetCidrReservation, nil
 }
